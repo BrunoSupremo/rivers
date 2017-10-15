@@ -1,0 +1,7 @@
+{
+	"info" : {
+		"name" : "rivers",
+		"version" : 3
+	},
+	"server_init_script": "file(rivers_server)"
+}

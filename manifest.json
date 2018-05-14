@@ -1,7 +1,11 @@
 {
 	"info" : {
 		"name" : "rivers",
+		"name_space" : "rivers",
 		"version" : 3
 	},
-	"server_init_script": "file(rivers_server)"
+	"server_init_script": "file(rivers_server)",
+	"mixintos": {
+		"stonehearth/data/biome/temperate_generation_data.json": "file(temperate_generation_data.json)"
+	}
 }

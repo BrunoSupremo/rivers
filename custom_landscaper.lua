@@ -7,25 +7,10 @@ local CustomLandscaper = class()
 
 local Astar = require 'astar'
 local noise_height_map --this noise is to mess with the astar to avoid straight line rivers
-local region_sizes --small areas are ignored, else it will create small pity rivers
+local regions --.size, .start and .ending
+local min_required_region_size = 10
+local rivers_info
 local log = radiant.log.create_logger('meu_log')
-local biome_name
-
-function CustomLandscaper:mark_water_bodies_check(elevation_map, feature_map)
-	local mod_name = stonehearth.world_generation:get_biome_alias()
-	-- mod_name is the mod that has the current biome
-	local colon_pos = string.find (mod_name, ":", 1, true) or -1
-	mod_name = string.sub (mod_name, 1, colon_pos-1)
-	local modded_function_name = "mark_water_bodies_" .. mod_name
-	if self[modded_function_name]~=nil then
-		-- the current biome also mods this same function, so call its proper modded function
-		-- e.g. the archipelago has a function named mark_water_bodies_archipelago_biome()
-		self[modded_function_name](self, elevation_map, feature_map)
-	else
-		-- the biome does not have a modded function, so call default river function
-		self:mark_water_bodies_rivers(elevation_map, feature_map)
-	end
-end
 
 function CustomLandscaper:mark_water_bodies_original(elevation_map, feature_map)
    local rng = self._rng
@@ -67,16 +52,43 @@ function CustomLandscaper:mark_water_bodies_original(elevation_map, feature_map)
    self:_add_deep_water(feature_map)
 end
 
-function CustomLandscaper:mark_water_bodies_rivers(elevation_map, feature_map)
-	biome_name = string.match(stonehearth.world_generation:get_biome_alias(), ".*:(%a+)") or "no_alias_biome"
-	local keep_original_map_lakes = radiant.util.get_config(biome_name..".keep_original_map_lakes", true)
-	if keep_original_map_lakes then
+function CustomLandscaper:generate_defaults()
+	rivers_info = {}
+	rivers_info.keep_default_lake_generation = true
+	rivers_info.wide = {}
+	rivers_info.wide.min = 0
+	rivers_info.wide.max = 0
+	rivers_info.wide.allowed_at = {}
+	rivers_info.wide.allowed_at.plains = true
+	rivers_info.wide.allowed_at.foothills = false
+	rivers_info.wide.allowed_at.mountains = false
+	rivers_info.narrow = {}
+	rivers_info.narrow.min = 1
+	rivers_info.narrow.max = 1
+	rivers_info.narrow.allowed_at = {}
+	rivers_info.narrow.allowed_at.plains = true
+	rivers_info.narrow.allowed_at.foothills = false
+	rivers_info.narrow.allowed_at.mountains = false
+end
+
+function CustomLandscaper:mark_water_bodies(elevation_map, feature_map)
+	local rng = self._rng
+	local biome = self._biome
+
+	rivers_info = self._landscape_info.water.rivers
+	if not rivers_info then
+		self:generate_defaults()
+	end
+
+	if rivers_info.keep_default_lake_generation then
 		--this is the same as the original mark_water_... function as found in the stonehearth mod
 		self:mark_water_bodies_original(elevation_map,feature_map)
 	end
-
-	local rng = self._rng
-	local biome = self._biome
+	rivers_info.wide.fixed = rng:get_int(rivers_info.wide.min, rivers_info.wide.max)
+	rivers_info.narrow.fixed = rng:get_int(rivers_info.narrow.min, rivers_info.narrow.max)
+	if rivers_info.wide.fixed + rivers_info.narrow.fixed <1 then
+		return
+	end
 
 	noise_height_map = {}
 	noise_height_map.width = feature_map.width
@@ -84,6 +96,7 @@ function CustomLandscaper:mark_water_bodies_rivers(elevation_map, feature_map)
 	for j=1, feature_map.height do
 		for i=1, feature_map.width do
 			local elevation = elevation_map:get(i, j)
+			local terrain_type = biome:get_terrain_type(elevation)
 
 			local offset = (j-1)*feature_map.width+i
 			--creates and set the points
@@ -91,19 +104,32 @@ function CustomLandscaper:mark_water_bodies_rivers(elevation_map, feature_map)
 			noise_height_map[offset].x = i
 			noise_height_map[offset].y = j
 			noise_height_map[offset].elevation = elevation
+			noise_height_map[offset].terrain_type = terrain_type
 			noise_height_map[offset].noise = rng:get_int(1,100)
 		end
 	end
 	self:mark_borders() --it is important to avoid generating close to the borders
-	if self:river_create_regions() then -- creates and check for big regions to spawn rivers
+	if self:river_create_regions() then -- try to create and check if regions exist to spawn rivers
 		self:add_rivers(feature_map)
 	end
 end
 
 function CustomLandscaper:mark_borders()
+	local radius = 2
+	if rivers_info.wide.fixed <1 then
+		radius = 1
+	end
+	local allowed_at = {
+		plains = rivers_info.wide.allowed_at.plains or rivers_info.narrow.allowed_at.plains,
+		foothills = rivers_info.wide.allowed_at.foothills or rivers_info.narrow.allowed_at.foothills,
+		mountains = rivers_info.wide.allowed_at.mountains or rivers_info.narrow.allowed_at.mountains 
+	}
 	local function neighbors_have_different_elevations(x,y,offset)
-		for j=y-2, y+2 do --the border will be 2 tiles thick
-			for i=x-2, x+2 do
+		if not allowed_at[noise_height_map[offset].terrain_type] then
+			return true
+		end
+		for j=y-radius, y+radius do --the border will be 2 tiles thick
+			for i=x-radius, x+radius do
 				local neighbor_offset = (j-1)*noise_height_map.width+i
 				if noise_height_map[neighbor_offset] then
 					if noise_height_map[neighbor_offset].elevation ~= noise_height_map[offset].elevation then
@@ -115,30 +141,47 @@ function CustomLandscaper:mark_borders()
 		return false
 	end
 
-	for y=1, noise_height_map.height do
-		for x=1, noise_height_map.width do
-			local offset = (y-1)*noise_height_map.width+x
-			noise_height_map[offset].border = neighbors_have_different_elevations(x,y,offset)
+	if noise_height_map.width>50 then
+		--for big (default) worlds, excludes the non-visible portion of the map
+		for y=1, noise_height_map.height do
+			for x=1, noise_height_map.width do
+				local offset = (y-1)*noise_height_map.width+x
+				noise_height_map[offset].border = true
+			end
+		end
+		for y=32, noise_height_map.height-31 do
+			for x=32, noise_height_map.width-31 do
+				local offset = (y-1)*noise_height_map.width+x
+				noise_height_map[offset].border = neighbors_have_different_elevations(x,y,offset)
+			end
+		end
+	else
+		--tiny world, use it all
+		for y=1, noise_height_map.height do
+			for x=1, noise_height_map.width do
+				local offset = (y-1)*noise_height_map.width+x
+				noise_height_map[offset].border = neighbors_have_different_elevations(x,y,offset)
+			end
 		end
 	end
 end
 
 function CustomLandscaper:river_create_regions()
-	region_sizes = {}
+	regions = {}
 	--creates multiple regions, where each point has a path to any other within the region
-	local has_at_least_one_big_region = false
-	local region = 0
+	local has_at_least_one_usable_area = false
+	local region_index = 1
 	for y=1, noise_height_map.height do
 		for x=1, noise_height_map.width do
 			local offset = (y-1)*noise_height_map.width+x
 			if not noise_height_map[offset].border then
 				if not noise_height_map[offset].region then
-					region = region +1
-					region_sizes[region] = self:river_flood_fill_region(x,y, region)
+					local region_candidate = self:river_flood_fill_region(x,y, region_index)
 
-					if region_sizes[region]>1500 then -- roughly 38x38 area (19x19 in mini map)
-						--the 1500 value was chosen arbitrary, on what I experienced as "good enough"
-						has_at_least_one_big_region = true
+					if region_candidate.size>min_required_region_size then
+						has_at_least_one_usable_area = true
+						regions[region_index] = region_candidate
+						region_index = region_index +1
 					end
 				end
 			end
@@ -146,120 +189,139 @@ function CustomLandscaper:river_create_regions()
 	end
 
 	--this is used to procced or skip the river generation (no need to try if there is no space)
-	return has_at_least_one_big_region
+	return has_at_least_one_usable_area
 end
 
 function CustomLandscaper:river_flood_fill_region(x,y, region)
 	local offset = (y-1)*noise_height_map.width+x
-	local size = 0
 	local openset = {}
 
-	table.insert( openset, noise_height_map[offset] )
+	local start = offset
+	local ending = offset
 
-	while #openset>0 do
-		local current = table.remove(openset)
-		current.region = region
-		size = size +1
+	local current
+	local index = 1
+	local size = 1
+	openset[index] = offset
+	noise_height_map[offset].checked = true
+	while openset[index]~=nil do
+		--find the most distant point in this region from that initially chosen
+		current = noise_height_map[ openset[index] ]
+		noise_height_map[ openset[index] ].region = region
 
 		local offset_left = (current.y-1)*noise_height_map.width+current.x -1
-		if current.x>1 and noise_height_map[offset_left].border==false and not noise_height_map[offset_left].region then
-			table.insert( openset, noise_height_map[offset_left] )
+		if current.x>1 and noise_height_map[offset_left].border==false and not noise_height_map[offset_left].checked then
+			size = size +1
+			openset[size] = offset_left
+			noise_height_map[offset_left].checked = true
 		end
 
 		local offset_right = (current.y-1)*noise_height_map.width+current.x +1
-		if current.x<noise_height_map.width and noise_height_map[offset_right].border==false and not noise_height_map[offset_right].region then
-			table.insert( openset, noise_height_map[offset_right] )
+		if current.x<noise_height_map.width and noise_height_map[offset_right].border==false and not noise_height_map[offset_right].checked then
+			size = size +1
+			openset[size] = offset_right
+			noise_height_map[offset_right].checked = true
 		end
 
 		local offset_up = (current.y-2)*noise_height_map.width+current.x
-		if current.y>1 and noise_height_map[offset_up].border==false and not noise_height_map[offset_up].region then
-			table.insert( openset, noise_height_map[offset_up] )
+		if current.y>1 and noise_height_map[offset_up].border==false and not noise_height_map[offset_up].checked then
+			size = size +1
+			openset[size] = offset_up
+			noise_height_map[offset_up].checked = true
 		end
 
 		local offset_down = (current.y)*noise_height_map.width+current.x
-		if current.y<noise_height_map.height and noise_height_map[offset_down].border==false and not noise_height_map[offset_down].region then
-			table.insert( openset, noise_height_map[offset_down] )
+		if current.y<noise_height_map.height and noise_height_map[offset_down].border==false and not noise_height_map[offset_down].checked then
+			size = size +1
+			openset[size] = offset_down
+			noise_height_map[offset_down].checked = true
 		end
+
+		index = index +1
+	end
+	start = openset[size]
+
+	if size > min_required_region_size then
+		--reverse the flood to find the oposing most distant point
+		local second_openset = {}
+		index = 1
+		size = 1
+		second_openset[index] = start
+		noise_height_map[start].second_pass = true
+		while second_openset[index]~=nil do
+			current = noise_height_map[ second_openset[index] ]
+
+			local offset_left = (current.y-1)*noise_height_map.width+current.x -1
+			if current.x>1 and noise_height_map[offset_left].border==false and not noise_height_map[offset_left].second_pass then
+				size = size +1
+				second_openset[size] = offset_left
+				noise_height_map[offset_left].second_pass = true
+			end
+
+			local offset_right = (current.y-1)*noise_height_map.width+current.x +1
+			if current.x<noise_height_map.width and noise_height_map[offset_right].border==false and not noise_height_map[offset_right].second_pass then
+				size = size +1
+				second_openset[size] = offset_right
+				noise_height_map[offset_right].second_pass = true
+			end
+
+			local offset_up = (current.y-2)*noise_height_map.width+current.x
+			if current.y>1 and noise_height_map[offset_up].border==false and not noise_height_map[offset_up].second_pass then
+				size = size +1
+				second_openset[size] = offset_up
+				noise_height_map[offset_up].second_pass = true
+			end
+
+			local offset_down = (current.y)*noise_height_map.width+current.x
+			if current.y<noise_height_map.height and noise_height_map[offset_down].border==false and not noise_height_map[offset_down].second_pass then
+				size = size +1
+				second_openset[size] = offset_down
+				noise_height_map[offset_down].second_pass = true
+			end
+
+			index = index +1
+		end
+		ending = second_openset[size]
 	end
 
-	return size
+	return {size = size, start = start, ending = ending}
 end
 
 function CustomLandscaper:add_rivers(feature_map)
 
-	local function grab_random_region()
-		local region_number
-		repeat
-			region_number = self._rng:get_int(1, #region_sizes)
-		until
-			--should only get big regions
-			region_sizes[region_number]>1500 -- roughly 38x38 area (19x19 in mini map)
-		return region_number
-	end
+	local function grab_bigest_region()
+		local bigest_region = 0
+		local current_bigest_size = 0
 
-	local function grab_random_point(region)
-		local x,y,point_offset
-		repeat
-			x = self._rng:get_int(1, noise_height_map.width)
-			y = self._rng:get_int(1, noise_height_map.height)
-			point_offset = (y-1)*noise_height_map.width+x
-		until
-			noise_height_map[point_offset].border==false and
-			--same region means there is path between the points
-			noise_height_map[point_offset].region == region
-		return point_offset
-	end
-	
-	local function grab_distance_between_points(offset, offset2)
-		local dx = noise_height_map[offset2].x-noise_height_map[offset].x
-		local dy = noise_height_map[offset2].y-noise_height_map[offset].y
-		return math.sqrt(dx*dx + dy*dy)
-	end
-	
-	local function grab_the_two_most_distance_points(offset, offset2, offset3)
-		local dist_1_2 = grab_distance_between_points(offset, offset2)
-		local dist_1_3 = grab_distance_between_points(offset, offset3)
-		local dist_2_3 = grab_distance_between_points(offset2,offset3)
-
-		if dist_1_2 > dist_1_3 and dist_1_2 > dist_2_3 then
-			return offset, offset2
-		else
-			if dist_1_3 > dist_1_2 and dist_1_3 > dist_2_3 then
-				return offset, offset3
-			else
-				return offset2, offset3
+		for i,v in pairs(regions) do
+			if regions[i].size > current_bigest_size then
+				bigest_region = i
+				current_bigest_size = regions[i].size
 			end
 		end
+		if bigest_region <1 then
+			return nil
+		end
+		return bigest_region
 	end
 
-	local narrow_river_counter = radiant.util.get_config(biome_name..".narrow_river_counter", 1)
-	local wide_river_counter = radiant.util.get_config(biome_name..".wide_river_counter", 1)
-	local offset,offset2,offset3, region
+	while rivers_info.wide.fixed + rivers_info.narrow.fixed >0 do
+		local region = grab_bigest_region()
+		if not region then break end
 
-	for rivers=1, narrow_river_counter do
-		region = grab_random_region()
+		local start = regions[region].start
+		local ending = regions[region].ending
 
-		offset = grab_random_point(region)
-		offset2 = grab_random_point(region)
-		offset3 = grab_random_point(region)
-		
-		--sometimes the chosen two points are too close, making lame rivers.
-		--thats why I'm using 3 points and from that grabbing the two most far from each other.
-		--this decreases the chances of having super close start and end points
-		offset,offset2 = grab_the_two_most_distance_points(offset, offset2, offset3)
-
-		self:draw_river(noise_height_map[offset], noise_height_map[offset2], feature_map,"narrow")
-	end
-	for rivers=1, wide_river_counter do
-		region = grab_random_region()
-
-		offset = grab_random_point(region)
-		offset2 = grab_random_point(region)
-		offset3 = grab_random_point(region)
-
-		offset,offset2 = grab_the_two_most_distance_points(offset, offset2, offset3)
-
-		self:draw_river(noise_height_map[offset], noise_height_map[offset2], feature_map,"wide")
+		if rivers_info.wide.fixed >0 and rivers_info.wide.allowed_at[ noise_height_map[start].terrain_type ] then
+			self:draw_river(noise_height_map[start], noise_height_map[ending], feature_map, "wide")
+			rivers_info.wide.fixed = rivers_info.wide.fixed -1
+		else
+			if rivers_info.narrow.fixed >0 and rivers_info.narrow.allowed_at[ noise_height_map[start].terrain_type ] then
+				self:draw_river(noise_height_map[start], noise_height_map[ending], feature_map, "narrow")
+				rivers_info.narrow.fixed = rivers_info.narrow.fixed -1
+			end
+		end
+		regions[region] = nil
 	end
 end
 
